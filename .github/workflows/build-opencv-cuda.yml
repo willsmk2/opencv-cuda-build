@@ -41,6 +41,19 @@ jobs:
           echo "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           echo "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
+      - name: Patch opencv_contrib (missing 'ulong' typedef on Windows/CUDA 12.4)
+        shell: pwsh
+        run: |
+          # NVIDIA's CUDA headers deliberately don't typedef 'ulong' on Windows
+          # (unsigned long is 32-bit there vs 64-bit on Linux, so they skip it to
+          # avoid ambiguity). opencv_contrib's cudev module uses 'ulong' assuming
+          # it's always available, which only works on Windows by accident (some
+          # other header usually pulls it in first). Patch it in explicitly.
+          $commonHpp = "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp"
+          $patch = "#if defined(_WIN32)`ntypedef unsigned long ulong;`n#endif`n"
+          $original = Get-Content $commonHpp -Raw
+          Set-Content -Path $commonHpp -Value ($patch + $original) -NoNewline
+
       - name: Configure with CMake
         shell: pwsh
         run: |
