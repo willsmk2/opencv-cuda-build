@@ -1,3 +1,4 @@
+```yaml
 name: Build opencv_world500 (CUDA, GTX 1660 / sm_75)
 
 on:
@@ -8,8 +9,9 @@ jobs:
     runs-on: windows-2022
 
     steps:
+
       # ============================================================
-      # 1. Clone OpenCV 5.0.0 + opencv_contrib 5.0.0
+      # 1. OpenCV 5.0.0 + contrib 5.0.0
       # ============================================================
       - name: Clone OpenCV 5.0.0 + opencv_contrib
         shell: pwsh
@@ -27,7 +29,6 @@ jobs:
       # 3. Cache CUDA installer
       # ============================================================
       - name: Cache CUDA installer
-        id: cache-cuda
         uses: actions/cache@v4
         with:
           path: cuda_installer.exe
@@ -39,8 +40,8 @@ jobs:
       - name: Install CUDA Toolkit
         shell: pwsh
         run: |
-          if (-not (Test-Path cuda_installer.exe)) {
-            Write-Host "Downloading CUDA 12.4 network installer..."
+          if (-not (Test-Path "cuda_installer.exe")) {
+            Write-Host "Downloading CUDA 12.4..."
             curl.exe -L `
               -o cuda_installer.exe `
               https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
@@ -72,31 +73,26 @@ jobs:
             throw "CUDA installation failed: nvcc.exe not found."
           }
 
-          Write-Host "CUDA installed at: $cudaPath"
-
           "CUDA_PATH=$cudaPath" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
+            Out-File $env:GITHUB_ENV -Append
 
           "$cudaPath\bin" |
-            Out-File -FilePath $env:GITHUB_PATH -Append
+            Out-File $env:GITHUB_PATH -Append
+
+          Write-Host "CUDA 12.4 installed successfully."
 
       # ============================================================
-      # 5. Patch Windows 'ulong' issue
+      # 5. Patch Windows ulong problem
       #
-      # IMPORTANT:
-      # Keep this patch.
-      # Do NOT add longlong / ulonglong.
+      # OpenCV 5.0.0/contrib uses CUDA's 'ulong' spelling.
+      # MSVC/NVCC on Windows does not expose it automatically.
       # ============================================================
-      - name: Patch OpenCV CUDA ulong for Windows
+      - name: Patch CUDA ulong
         shell: pwsh
         run: |
-          $commonHpp = "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp"
+          $file = "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp"
 
-          if (-not (Test-Path $commonHpp)) {
-            throw "common.hpp not found: $commonHpp"
-          }
-
-          $content = Get-Content $commonHpp -Raw
+          $content = Get-Content $file -Raw
 
           if ($content -notmatch "typedef unsigned long ulong;") {
 
@@ -108,79 +104,153 @@ jobs:
           "@
 
             Set-Content `
-              -Path $commonHpp `
+              -Path $file `
               -Value ($patch + $content) `
               -NoNewline
 
             Write-Host "Added Windows ulong typedef."
           }
           else {
-            Write-Host "ulong typedef already present."
+            Write-Host "ulong typedef already exists."
           }
 
       # ============================================================
-      # 6. Patch missing int64_t / uint64_t VecTraits
+      # 6. Complete OpenCV 5.0.0 64-bit CUDA cudev patch
+      #
+      # Provides:
+      #   MakeVec<int64_t, 1..4>
+      #   MakeVec<uint64_t, 1..4>
+      #
+      #   VecTraits<int64_t>
+      #   VecTraits<uint64_t>
+      #
+      #   VecTraits<longlong1..4>
+      #   VecTraits<ulonglong1..4>
       #
       # IMPORTANT:
-      # This replaces the previous BAD longlong/ulonglong patch.
+      # No 'longlong' or 'ulonglong' scalar aliases are created.
+      # Those were the source of the previous errors.
       # ============================================================
-      - name: Patch OpenCV CUDA 64-bit VecTraits
+      - name: Patch CUDA 64-bit vector traits
         shell: pwsh
         run: |
-          $vecTraits = "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp"
+          $file = "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp"
 
-          if (-not (Test-Path $vecTraits)) {
-            throw "vec_traits.hpp not found: $vecTraits"
+          if (-not (Test-Path $file)) {
+            throw "vec_traits.hpp not found."
           }
 
-          $content = Get-Content $vecTraits -Raw
+          $content = Get-Content $file -Raw
 
           # ----------------------------------------------------------
-          # Safety check:
-          # Make absolutely sure the bad aliases are NOT present.
+          # Remove any previous experimental patch if present.
+          #
+          # This protects the build if this workflow is adapted from
+          # the previous version.
           # ----------------------------------------------------------
-          if (
-            $content -match "MakeVec<longlong" -or
-            $content -match "MakeVec<ulonglong" -or
-            $content -match "VecTraits<longlong" -or
-            $content -match "VecTraits<ulonglong"
-          ) {
-            throw @"
-          BAD longlong/ulonglong patch detected in vec_traits.hpp.
 
-          Remove the old patch completely.
-          Do not define or instantiate longlong / ulonglong.
-          "@
-          }
+          $content = [regex]::Replace(
+            $content,
+            '(?s)// OpenCV 5\.0 adds CV_64S / CV_64U\..*?#endif\s*',
+            ''
+          )
 
           # ----------------------------------------------------------
-          # Prevent duplicate patching
+          # Make sure our patch isn't duplicated.
           # ----------------------------------------------------------
-          if ($content -match "OpenCV 5\.0 adds CV_64S / CV_64U") {
-            Write-Host "64-bit VecTraits patch already present."
+          if ($content -match "OPENCV_CUDEV_64BIT_FIX") {
+            Write-Host "64-bit patch already present."
+            Set-Content -Path $file -Value $content -NoNewline
             exit 0
           }
 
+          # ----------------------------------------------------------
+          # Find the end of the existing ulong VecTraits block.
+          #
+          # We insert our definitions immediately after the existing
+          # OpenCV ulong traits.
+          # ----------------------------------------------------------
           $needle = "CV_CUDEV_VEC_TRAITS_INST(ulong)"
 
           if (-not $content.Contains($needle)) {
-            throw "Could not find insertion point: $needle"
+            throw "Could not find CV_CUDEV_VEC_TRAITS_INST(ulong)."
           }
 
-          $replacement = @"
-          CV_CUDEV_VEC_TRAITS_INST(ulong)
+          $patch = @'
 
-          // OpenCV 5.0 adds CV_64S / CV_64U.
-          // gpu_mat.cu directly instantiates CUDA cudev templates
-          // with int64_t / uint64_t, but OpenCV 5.0.0 does not
-          // provide scalar VecTraits specializations for them.
+          // ==========================================================
+          // OPENCV_CUDEV_64BIT_FIX
+          //
+          // OpenCV 5.0.0 gpu_mat.cu instantiates cudev templates
+          // directly with int64_t / uint64_t.
+          //
+          // OpenCV 5.0.0's cudev vec_traits.hpp does not provide
+          // the required MakeVec/VecTraits implementations.
+          // ==========================================================
 
-          #if defined(_WIN32)
+          // ----------------------------------------------------------
+          // MakeVec - signed 64-bit
+          // ----------------------------------------------------------
 
-          template <> struct VecTraits<int64_t>
+          template <> struct MakeVec<int64_t, 1>
+          {
+              typedef int64_t type;
+          };
+
+          template <> struct MakeVec<int64_t, 2>
+          {
+              typedef longlong2 type;
+          };
+
+          template <> struct MakeVec<int64_t, 3>
+          {
+              typedef longlong3 type;
+          };
+
+          template <> struct MakeVec<int64_t, 4>
+          {
+              typedef longlong4 type;
+          };
+
+
+          // ----------------------------------------------------------
+          // MakeVec - unsigned 64-bit
+          // ----------------------------------------------------------
+
+          template <> struct MakeVec<uint64_t, 1>
+          {
+              typedef uint64_t type;
+          };
+
+          template <> struct MakeVec<uint64_t, 2>
+          {
+              typedef ulonglong2 type;
+          };
+
+          template <> struct MakeVec<uint64_t, 3>
+          {
+              typedef ulonglong3 type;
+          };
+
+          template <> struct MakeVec<uint64_t, 4>
+          {
+              typedef ulonglong4 type;
+          };
+
+
+          // ----------------------------------------------------------
+          // VecTraits - scalar int64_t
+          // ----------------------------------------------------------
+
+          template <>
+          struct VecTraits<int64_t>
           {
               typedef int64_t elem_type;
-              enum { cn = 1 };
+
+              enum
+              {
+                  cn = 1
+              };
 
               static __host__ __device__ __forceinline__
               int64_t all(int64_t v)
@@ -189,9 +259,9 @@ jobs:
               }
 
               static __host__ __device__ __forceinline__
-              int64_t make(int64_t x)
+              int64_t make(int64_t v)
               {
-                  return x;
+                  return v;
               }
 
               static __host__ __device__ __forceinline__
@@ -201,10 +271,20 @@ jobs:
               }
           };
 
-          template <> struct VecTraits<uint64_t>
+
+          // ----------------------------------------------------------
+          // VecTraits - scalar uint64_t
+          // ----------------------------------------------------------
+
+          template <>
+          struct VecTraits<uint64_t>
           {
               typedef uint64_t elem_type;
-              enum { cn = 1 };
+
+              enum
+              {
+                  cn = 1
+              };
 
               static __host__ __device__ __forceinline__
               uint64_t all(uint64_t v)
@@ -213,9 +293,9 @@ jobs:
               }
 
               static __host__ __device__ __forceinline__
-              uint64_t make(uint64_t x)
+              uint64_t make(uint64_t v)
               {
-                  return x;
+                  return v;
               }
 
               static __host__ __device__ __forceinline__
@@ -225,69 +305,338 @@ jobs:
               }
           };
 
-          #endif
-          "@
+
+          // ----------------------------------------------------------
+          // VecTraits - signed 64-bit CUDA vectors
+          // ----------------------------------------------------------
+
+          template <>
+          struct VecTraits<longlong1>
+          {
+              typedef int64_t elem_type;
+              enum { cn = 1 };
+
+              static __host__ __device__ __forceinline__
+              longlong1 all(int64_t v)
+              {
+                  return make_longlong1(v);
+              }
+
+              static __host__ __device__ __forceinline__
+              longlong1 make(int64_t v)
+              {
+                  return make_longlong1(v);
+              }
+
+              static __host__ __device__ __forceinline__
+              longlong1 make(const int64_t* v)
+              {
+                  return make_longlong1(v[0]);
+              }
+          };
+
+
+          template <>
+          struct VecTraits<longlong2>
+          {
+              typedef int64_t elem_type;
+              enum { cn = 2 };
+
+              static __host__ __device__ __forceinline__
+              longlong2 all(int64_t v)
+              {
+                  return make_longlong2(v, v);
+              }
+
+              static __host__ __device__ __forceinline__
+              longlong2 make(int64_t x, int64_t y)
+              {
+                  return make_longlong2(x, y);
+              }
+
+              static __host__ __device__ __forceinline__
+              longlong2 make(const int64_t* v)
+              {
+                  return make_longlong2(v[0], v[1]);
+              }
+          };
+
+
+          template <>
+          struct VecTraits<longlong3>
+          {
+              typedef int64_t elem_type;
+              enum { cn = 3 };
+
+              static __host__ __device__ __forceinline__
+              longlong3 all(int64_t v)
+              {
+                  return make_longlong3(v, v, v);
+              }
+
+              static __host__ __device__ __forceinline__
+              longlong3 make(int64_t x, int64_t y, int64_t z)
+              {
+                  return make_longlong3(x, y, z);
+              }
+
+              static __host__ __device__ __forceinline__
+              longlong3 make(const int64_t* v)
+              {
+                  return make_longlong3(v[0], v[1], v[2]);
+              }
+          };
+
+
+          template <>
+          struct VecTraits<longlong4>
+          {
+              typedef int64_t elem_type;
+              enum { cn = 4 };
+
+              static __host__ __device__ __forceinline__
+              longlong4 all(int64_t v)
+              {
+                  return make_longlong4(v, v, v, v);
+              }
+
+              static __host__ __device__ __forceinline__
+              longlong4 make(
+                  int64_t x,
+                  int64_t y,
+                  int64_t z,
+                  int64_t w)
+              {
+                  return make_longlong4(x, y, z, w);
+              }
+
+              static __host__ __device__ __forceinline__
+              longlong4 make(const int64_t* v)
+              {
+                  return make_longlong4(
+                      v[0],
+                      v[1],
+                      v[2],
+                      v[3]
+                  );
+              }
+          };
+
+
+          // ----------------------------------------------------------
+          // VecTraits - unsigned 64-bit CUDA vectors
+          // ----------------------------------------------------------
+
+          template <>
+          struct VecTraits<ulonglong1>
+          {
+              typedef uint64_t elem_type;
+              enum { cn = 1 };
+
+              static __host__ __device__ __forceinline__
+              ulonglong1 all(uint64_t v)
+              {
+                  return make_ulonglong1(v);
+              }
+
+              static __host__ __device__ __forceinline__
+              ulonglong1 make(uint64_t v)
+              {
+                  return make_ulonglong1(v);
+              }
+
+              static __host__ __device__ __forceinline__
+              ulonglong1 make(const uint64_t* v)
+              {
+                  return make_ulonglong1(v[0]);
+              }
+          };
+
+
+          template <>
+          struct VecTraits<ulonglong2>
+          {
+              typedef uint64_t elem_type;
+              enum { cn = 2 };
+
+              static __host__ __device__ __forceinline__
+              ulonglong2 all(uint64_t v)
+              {
+                  return make_ulonglong2(v, v);
+              }
+
+              static __host__ __device__ __forceinline__
+              ulonglong2 make(uint64_t x, uint64_t y)
+              {
+                  return make_ulonglong2(x, y);
+              }
+
+              static __host__ __device__ __forceinline__
+              ulonglong2 make(const uint64_t* v)
+              {
+                  return make_ulonglong2(v[0], v[1]);
+              }
+          };
+
+
+          template <>
+          struct VecTraits<ulonglong3>
+          {
+              typedef uint64_t elem_type;
+              enum { cn = 3 };
+
+              static __host__ __device__ __forceinline__
+              ulonglong3 all(uint64_t v)
+              {
+                  return make_ulonglong3(v, v, v);
+              }
+
+              static __host__ __device__ __forceinline__
+              ulonglong3 make(
+                  uint64_t x,
+                  uint64_t y,
+                  uint64_t z)
+              {
+                  return make_ulonglong3(x, y, z);
+              }
+
+              static __host__ __device__ __forceinline__
+              ulonglong3 make(const uint64_t* v)
+              {
+                  return make_ulonglong3(
+                      v[0],
+                      v[1],
+                      v[2]
+                  );
+              }
+          };
+
+
+          template <>
+          struct VecTraits<ulonglong4>
+          {
+              typedef uint64_t elem_type;
+              enum { cn = 4 };
+
+              static __host__ __device__ __forceinline__
+              ulonglong4 all(uint64_t v)
+              {
+                  return make_ulonglong4(v, v, v, v);
+              }
+
+              static __host__ __device__ __forceinline__
+              ulonglong4 make(
+                  uint64_t x,
+                  uint64_t y,
+                  uint64_t z,
+                  uint64_t w)
+              {
+                  return make_ulonglong4(x, y, z, w);
+              }
+
+              static __host__ __device__ __forceinline__
+              ulonglong4 make(const uint64_t* v)
+              {
+                  return make_ulonglong4(
+                      v[0],
+                      v[1],
+                      v[2],
+                      v[3]
+                  );
+              }
+          };
+
+          // ==========================================================
+          // END OPENCV_CUDEV_64BIT_FIX
+          // ==========================================================
+          '@
 
           $content = $content.Replace(
-            $needle,
-            $replacement
+              $needle,
+              $needle + $patch
           )
 
           Set-Content `
-            -Path $vecTraits `
-            -Value $content `
-            -NoNewline
+              -Path $file `
+              -Value $content `
+              -NoNewline
 
-          Write-Host "Added VecTraits<int64_t>."
-          Write-Host "Added VecTraits<uint64_t>."
+          Write-Host "64-bit CUDA cudev patch installed."
 
       # ============================================================
-      # 7. Verify patches
+      # 7. Verify that the source contains the complete fix
       # ============================================================
-      - name: Verify CUDA patches
+      - name: Verify CUDA source patches
         shell: pwsh
         run: |
-          $commonHpp = "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp"
-          $vecTraits = "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp"
+          $common = Get-Content `
+            "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp" `
+            -Raw
 
-          $common = Get-Content $commonHpp -Raw
-          $vec = Get-Content $vecTraits -Raw
+          $traits = Get-Content `
+            "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp" `
+            -Raw
 
           if ($common -notmatch "typedef unsigned long ulong;") {
-            throw "Verification failed: ulong typedef missing."
+            throw "Missing ulong typedef."
           }
 
-          if ($vec -notmatch "VecTraits<int64_t>") {
-            throw "Verification failed: VecTraits<int64_t> missing."
+          $required = @(
+            "MakeVec<int64_t, 1>",
+            "MakeVec<int64_t, 2>",
+            "MakeVec<int64_t, 3>",
+            "MakeVec<int64_t, 4>",
+            "MakeVec<uint64_t, 1>",
+            "MakeVec<uint64_t, 2>",
+            "MakeVec<uint64_t, 3>",
+            "MakeVec<uint64_t, 4>",
+            "VecTraits<int64_t>",
+            "VecTraits<uint64_t>",
+            "VecTraits<longlong1>",
+            "VecTraits<longlong2>",
+            "VecTraits<longlong3>",
+            "VecTraits<longlong4>",
+            "VecTraits<ulonglong1>",
+            "VecTraits<ulonglong2>",
+            "VecTraits<ulonglong3>",
+            "VecTraits<ulonglong4>"
+          )
+
+          foreach ($item in $required) {
+            if ($traits -notmatch [regex]::Escape($item)) {
+              throw "Missing required definition: $item"
+            }
           }
 
-          if ($vec -notmatch "VecTraits<uint64_t>") {
-            throw "Verification failed: VecTraits<uint64_t> missing."
-          }
-
-          if ($vec -match "longlong|ulonglong") {
-            throw "Verification failed: forbidden longlong/ulonglong detected."
-          }
-
-          Write-Host "========================================"
-          Write-Host "CUDA patches verified successfully."
-          Write-Host "ulong            : OK"
-          Write-Host "VecTraits<int64_t> : OK"
-          Write-Host "VecTraits<uint64_t>: OK"
-          Write-Host "longlong aliases  : NOT PRESENT"
-          Write-Host "========================================"
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "CUDA/OpenCV 5.0.0 patch verification PASSED"
+          Write-Host "=============================================="
+          Write-Host "ulong typedef             : OK"
+          Write-Host "MakeVec<int64_t>          : OK"
+          Write-Host "MakeVec<uint64_t>         : OK"
+          Write-Host "VecTraits<int64_t>        : OK"
+          Write-Host "VecTraits<uint64_t>       : OK"
+          Write-Host "signed 64-bit vectors     : OK"
+          Write-Host "unsigned 64-bit vectors   : OK"
+          Write-Host "=============================================="
 
       # ============================================================
-      # 8. Configure CMake
+      # 8. Configure OpenCV
       # ============================================================
       - name: Configure with CMake
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force opencv\build | Out-Null
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            "opencv\build" | Out-Null
 
-          Set-Location opencv\build
+          Set-Location "opencv\build"
 
-          cmake -G "Visual Studio 17 2022" -A x64 `
+          cmake `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
             -D CMAKE_BUILD_TYPE=Release `
             -D CMAKE_INSTALL_PREFIX="$PWD\install" `
             -D BUILD_opencv_world=ON `
@@ -311,17 +660,18 @@ jobs:
       - name: Build + install
         shell: pwsh
         run: |
-          Set-Location opencv\build
+          Set-Location "opencv\build"
 
-          cmake --build . `
+          cmake `
+            --build . `
             --config Release `
             --target INSTALL `
             -- /m
 
       # ============================================================
-      # 10. Verify output
+      # 10. Verify final binaries
       # ============================================================
-      - name: Verify OpenCV output
+      - name: Verify OpenCV binaries
         shell: pwsh
         run: |
           $dll = "opencv\build\install\x64\vc17\bin\opencv_world500.dll"
@@ -335,16 +685,18 @@ jobs:
             throw "opencv_world500.lib was not produced."
           }
 
-          Write-Host "========================================"
-          Write-Host "OpenCV build successful!"
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "SUCCESS"
+          Write-Host "=============================================="
           Write-Host "DLL: $dll"
           Write-Host "LIB: $lib"
-          Write-Host "========================================"
+          Write-Host "=============================================="
 
       # ============================================================
       # 11. Upload
       # ============================================================
-      - name: Upload opencv_world500.dll / .lib
+      - name: Upload OpenCV CUDA build
         uses: actions/upload-artifact@v4
         with:
           name: opencv_world500-cuda-win64
@@ -352,3 +704,4 @@ jobs:
             opencv/build/install/x64/vc17/bin/opencv_world500.dll
             opencv/build/install/x64/vc17/lib/opencv_world500.lib
           if-no-files-found: error
+```
