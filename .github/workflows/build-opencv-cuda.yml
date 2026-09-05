@@ -54,6 +54,29 @@ jobs:
           $original = Get-Content $commonHpp -Raw
           Set-Content -Path $commonHpp -Value ($patch + $original) -NoNewline
 
+      - name: Patch opencv_contrib (missing 64-bit VecTraits/MakeVec on Windows)
+        shell: pwsh
+        run: |
+          # OpenCV 5.0 added 64-bit int Mat types. cudev's VecTraits/MakeVec only
+          # specialize 'long'/'ulong' for the 64-bit case, which works on Linux
+          # (where long is 64-bit) but not Windows (where long is 32-bit and the
+          # real 64-bit type is 'long long'). Add the missing specializations
+          # using OpenCV's own macros + CUDA's platform-independent longlong
+          # vector types.
+          $vecTraits = "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp"
+          $content = Get-Content $vecTraits -Raw
+
+          $content = $content.Replace(
+            "CV_CUDEV_MAKE_VEC_INST(ulong)",
+            "CV_CUDEV_MAKE_VEC_INST(ulong)`n#if defined(_WIN32)`nCV_CUDEV_MAKE_VEC_INST(longlong)`nCV_CUDEV_MAKE_VEC_INST(ulonglong)`n#endif"
+          )
+          $content = $content.Replace(
+            "CV_CUDEV_VEC_TRAITS_INST(ulong)",
+            "CV_CUDEV_VEC_TRAITS_INST(ulong)`n#if defined(_WIN32)`nCV_CUDEV_VEC_TRAITS_INST(longlong)`nCV_CUDEV_VEC_TRAITS_INST(ulonglong)`n#endif"
+          )
+
+          Set-Content -Path $vecTraits -Value $content -NoNewline
+
       - name: Configure with CMake
         shell: pwsh
         run: |
