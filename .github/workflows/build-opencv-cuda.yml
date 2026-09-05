@@ -1,4 +1,3 @@
-```yaml
 name: Build opencv_world500 (CUDA, GTX 1660 / sm_75)
 
 on:
@@ -704,4 +703,3 @@ jobs:
             opencv/build/install/x64/vc17/bin/opencv_world500.dll
             opencv/build/install/x64/vc17/lib/opencv_world500.lib
           if-no-files-found: error
-```
