@@ -1,23 +1,31 @@
 name: Build opencv_world500 (CUDA, GTX 1660 / sm_75)
 
-# Trigger manually from the Actions tab — this is a long-running build (often 1-2+ hours).
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-2022   # comes with Visual Studio 2022 preinstalled
+    runs-on: windows-2022
+
     steps:
+      # ============================================================
+      # 1. Clone OpenCV 5.0.0 + opencv_contrib 5.0.0
+      # ============================================================
       - name: Clone OpenCV 5.0.0 + opencv_contrib
         shell: pwsh
         run: |
           git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv.git
           git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv_contrib.git
 
+      # ============================================================
+      # 2. NASM
+      # ============================================================
       - name: Setup NASM
         uses: ilammy/setup-nasm@v1
 
-      # Cache the ~3GB CUDA network installer so re-runs don't re-download it
+      # ============================================================
+      # 3. Cache CUDA installer
+      # ============================================================
       - name: Cache CUDA installer
         id: cache-cuda
         uses: actions/cache@v4
@@ -25,63 +33,260 @@ jobs:
           path: cuda_installer.exe
           key: cuda-12.4.0-network-installer
 
-      - name: Install CUDA Toolkit (only the pieces we need)
+      # ============================================================
+      # 4. Install CUDA 12.4
+      # ============================================================
+      - name: Install CUDA Toolkit
         shell: pwsh
         run: |
           if (-not (Test-Path cuda_installer.exe)) {
-            Write-Host "Downloading CUDA network installer..."
-            curl -L -o cuda_installer.exe https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
-          } else {
+            Write-Host "Downloading CUDA 12.4 network installer..."
+            curl.exe -L `
+              -o cuda_installer.exe `
+              https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
+          }
+          else {
             Write-Host "Using cached CUDA installer."
           }
-          $components = "nvcc_12.4 cudart_12.4 cublas_12.4 cublas_dev_12.4 cufft_12.4 cufft_dev_12.4 npp_12.4 npp_dev_12.4"
-          Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s $components" -Wait -NoNewWindow
+
+          $components = @(
+            "nvcc_12.4",
+            "cudart_12.4",
+            "cublas_12.4",
+            "cublas_dev_12.4",
+            "cufft_12.4",
+            "cufft_dev_12.4",
+            "npp_12.4",
+            "npp_dev_12.4"
+          )
+
+          Start-Process `
+            -FilePath ".\cuda_installer.exe" `
+            -ArgumentList "-s $($components -join ' ')" `
+            -Wait `
+            -NoNewWindow
 
           $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-          echo "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      - name: Patch opencv_contrib (missing 'ulong' typedef on Windows/CUDA 12.4)
+          if (-not (Test-Path "$cudaPath\bin\nvcc.exe")) {
+            throw "CUDA installation failed: nvcc.exe not found."
+          }
+
+          Write-Host "CUDA installed at: $cudaPath"
+
+          "CUDA_PATH=$cudaPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+          "$cudaPath\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # ============================================================
+      # 5. Patch Windows 'ulong' issue
+      #
+      # IMPORTANT:
+      # Keep this patch.
+      # Do NOT add longlong / ulonglong.
+      # ============================================================
+      - name: Patch OpenCV CUDA ulong for Windows
         shell: pwsh
         run: |
-          # NVIDIA's CUDA headers deliberately don't typedef 'ulong' on Windows
-          # (unsigned long is 32-bit there vs 64-bit on Linux, so they skip it to
-          # avoid ambiguity). opencv_contrib's cudev module uses 'ulong' assuming
-          # it's always available, which only works on Windows by accident (some
-          # other header usually pulls it in first). Patch it in explicitly.
           $commonHpp = "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp"
-          $patch = "#if defined(_WIN32)`ntypedef unsigned long ulong;`n#endif`n"
-          $original = Get-Content $commonHpp -Raw
-          Set-Content -Path $commonHpp -Value ($patch + $original) -NoNewline
 
-      - name: Patch opencv_contrib (missing 64-bit VecTraits/MakeVec on Windows)
+          if (-not (Test-Path $commonHpp)) {
+            throw "common.hpp not found: $commonHpp"
+          }
+
+          $content = Get-Content $commonHpp -Raw
+
+          if ($content -notmatch "typedef unsigned long ulong;") {
+
+            $patch = @"
+          #if defined(_WIN32)
+          typedef unsigned long ulong;
+          #endif
+
+          "@
+
+            Set-Content `
+              -Path $commonHpp `
+              -Value ($patch + $content) `
+              -NoNewline
+
+            Write-Host "Added Windows ulong typedef."
+          }
+          else {
+            Write-Host "ulong typedef already present."
+          }
+
+      # ============================================================
+      # 6. Patch missing int64_t / uint64_t VecTraits
+      #
+      # IMPORTANT:
+      # This replaces the previous BAD longlong/ulonglong patch.
+      # ============================================================
+      - name: Patch OpenCV CUDA 64-bit VecTraits
         shell: pwsh
         run: |
-          # OpenCV 5.0 added 64-bit int Mat types. cudev's VecTraits/MakeVec only
-          # specialize 'long'/'ulong' for the 64-bit case, which works on Linux
-          # (where long is 64-bit) but not Windows (where long is 32-bit and the
-          # real 64-bit type is 'long long'). Add the missing specializations
-          # using OpenCV's own macros + CUDA's platform-independent longlong
-          # vector types.
           $vecTraits = "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp"
+
+          if (-not (Test-Path $vecTraits)) {
+            throw "vec_traits.hpp not found: $vecTraits"
+          }
+
           $content = Get-Content $vecTraits -Raw
 
+          # ----------------------------------------------------------
+          # Safety check:
+          # Make absolutely sure the bad aliases are NOT present.
+          # ----------------------------------------------------------
+          if (
+            $content -match "MakeVec<longlong" -or
+            $content -match "MakeVec<ulonglong" -or
+            $content -match "VecTraits<longlong" -or
+            $content -match "VecTraits<ulonglong"
+          ) {
+            throw @"
+          BAD longlong/ulonglong patch detected in vec_traits.hpp.
+
+          Remove the old patch completely.
+          Do not define or instantiate longlong / ulonglong.
+          "@
+          }
+
+          # ----------------------------------------------------------
+          # Prevent duplicate patching
+          # ----------------------------------------------------------
+          if ($content -match "OpenCV 5\.0 adds CV_64S / CV_64U") {
+            Write-Host "64-bit VecTraits patch already present."
+            exit 0
+          }
+
+          $needle = "CV_CUDEV_VEC_TRAITS_INST(ulong)"
+
+          if (-not $content.Contains($needle)) {
+            throw "Could not find insertion point: $needle"
+          }
+
+          $replacement = @"
+          CV_CUDEV_VEC_TRAITS_INST(ulong)
+
+          // OpenCV 5.0 adds CV_64S / CV_64U.
+          // gpu_mat.cu directly instantiates CUDA cudev templates
+          // with int64_t / uint64_t, but OpenCV 5.0.0 does not
+          // provide scalar VecTraits specializations for them.
+
+          #if defined(_WIN32)
+
+          template <> struct VecTraits<int64_t>
+          {
+              typedef int64_t elem_type;
+              enum { cn = 1 };
+
+              static __host__ __device__ __forceinline__
+              int64_t all(int64_t v)
+              {
+                  return v;
+              }
+
+              static __host__ __device__ __forceinline__
+              int64_t make(int64_t x)
+              {
+                  return x;
+              }
+
+              static __host__ __device__ __forceinline__
+              int64_t make(const int64_t* v)
+              {
+                  return *v;
+              }
+          };
+
+          template <> struct VecTraits<uint64_t>
+          {
+              typedef uint64_t elem_type;
+              enum { cn = 1 };
+
+              static __host__ __device__ __forceinline__
+              uint64_t all(uint64_t v)
+              {
+                  return v;
+              }
+
+              static __host__ __device__ __forceinline__
+              uint64_t make(uint64_t x)
+              {
+                  return x;
+              }
+
+              static __host__ __device__ __forceinline__
+              uint64_t make(const uint64_t* v)
+              {
+                  return *v;
+              }
+          };
+
+          #endif
+          "@
+
           $content = $content.Replace(
-            "CV_CUDEV_MAKE_VEC_INST(ulong)",
-            "CV_CUDEV_MAKE_VEC_INST(ulong)`n#if defined(_WIN32)`nCV_CUDEV_MAKE_VEC_INST(longlong)`nCV_CUDEV_MAKE_VEC_INST(ulonglong)`n#endif"
-          )
-          $content = $content.Replace(
-            "CV_CUDEV_VEC_TRAITS_INST(ulong)",
-            "CV_CUDEV_VEC_TRAITS_INST(ulong)`n#if defined(_WIN32)`nCV_CUDEV_VEC_TRAITS_INST(longlong)`nCV_CUDEV_VEC_TRAITS_INST(ulonglong)`n#endif"
+            $needle,
+            $replacement
           )
 
-          Set-Content -Path $vecTraits -Value $content -NoNewline
+          Set-Content `
+            -Path $vecTraits `
+            -Value $content `
+            -NoNewline
 
+          Write-Host "Added VecTraits<int64_t>."
+          Write-Host "Added VecTraits<uint64_t>."
+
+      # ============================================================
+      # 7. Verify patches
+      # ============================================================
+      - name: Verify CUDA patches
+        shell: pwsh
+        run: |
+          $commonHpp = "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp"
+          $vecTraits = "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp"
+
+          $common = Get-Content $commonHpp -Raw
+          $vec = Get-Content $vecTraits -Raw
+
+          if ($common -notmatch "typedef unsigned long ulong;") {
+            throw "Verification failed: ulong typedef missing."
+          }
+
+          if ($vec -notmatch "VecTraits<int64_t>") {
+            throw "Verification failed: VecTraits<int64_t> missing."
+          }
+
+          if ($vec -notmatch "VecTraits<uint64_t>") {
+            throw "Verification failed: VecTraits<uint64_t> missing."
+          }
+
+          if ($vec -match "longlong|ulonglong") {
+            throw "Verification failed: forbidden longlong/ulonglong detected."
+          }
+
+          Write-Host "========================================"
+          Write-Host "CUDA patches verified successfully."
+          Write-Host "ulong            : OK"
+          Write-Host "VecTraits<int64_t> : OK"
+          Write-Host "VecTraits<uint64_t>: OK"
+          Write-Host "longlong aliases  : NOT PRESENT"
+          Write-Host "========================================"
+
+      # ============================================================
+      # 8. Configure CMake
+      # ============================================================
       - name: Configure with CMake
         shell: pwsh
         run: |
-          mkdir opencv\build
-          cd opencv\build
+          New-Item -ItemType Directory -Force opencv\build | Out-Null
+
+          Set-Location opencv\build
+
           cmake -G "Visual Studio 17 2022" -A x64 `
             -D CMAKE_BUILD_TYPE=Release `
             -D CMAKE_INSTALL_PREFIX="$PWD\install" `
@@ -100,12 +305,45 @@ jobs:
             -D BUILD_opencv_python3=OFF `
             ..
 
+      # ============================================================
+      # 9. Build
+      # ============================================================
       - name: Build + install
         shell: pwsh
         run: |
-          cd opencv\build
-          cmake --build . --config Release --target INSTALL -- /m
+          Set-Location opencv\build
 
+          cmake --build . `
+            --config Release `
+            --target INSTALL `
+            -- /m
+
+      # ============================================================
+      # 10. Verify output
+      # ============================================================
+      - name: Verify OpenCV output
+        shell: pwsh
+        run: |
+          $dll = "opencv\build\install\x64\vc17\bin\opencv_world500.dll"
+          $lib = "opencv\build\install\x64\vc17\lib\opencv_world500.lib"
+
+          if (-not (Test-Path $dll)) {
+            throw "opencv_world500.dll was not produced."
+          }
+
+          if (-not (Test-Path $lib)) {
+            throw "opencv_world500.lib was not produced."
+          }
+
+          Write-Host "========================================"
+          Write-Host "OpenCV build successful!"
+          Write-Host "DLL: $dll"
+          Write-Host "LIB: $lib"
+          Write-Host "========================================"
+
+      # ============================================================
+      # 11. Upload
+      # ============================================================
       - name: Upload opencv_world500.dll / .lib
         uses: actions/upload-artifact@v4
         with:
