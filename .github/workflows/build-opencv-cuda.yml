@@ -1,0 +1,80 @@
+name: Build opencv_world500 (CUDA, GTX 1660 / sm_75)
+
+# Trigger manually from the Actions tab — this is a long-running build (often 1-2+ hours).
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022   # comes with Visual Studio 2022 preinstalled
+    steps:
+      - name: Clone OpenCV 5.0.0 + opencv_contrib
+        shell: pwsh
+        run: |
+          git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv.git
+          git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv_contrib.git
+
+      - name: Setup NASM
+        uses: ilammy/setup-nasm@v1
+
+      # Cache the ~3GB CUDA network installer so re-runs don't re-download it
+      - name: Cache CUDA installer
+        id: cache-cuda
+        uses: actions/cache@v4
+        with:
+          path: cuda_installer.exe
+          key: cuda-12.4.0-network-installer
+
+      - name: Install CUDA Toolkit (only the pieces we need)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path cuda_installer.exe)) {
+            Write-Host "Downloading CUDA network installer..."
+            curl -L -o cuda_installer.exe https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
+          } else {
+            Write-Host "Using cached CUDA installer."
+          }
+          $components = "nvcc_12.4 cudart_12.4 cublas_12.4 cublas_dev_12.4 cufft_12.4 cufft_dev_12.4 npp_12.4 npp_dev_12.4"
+          Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s $components" -Wait -NoNewWindow
+
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+          echo "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Configure with CMake
+        shell: pwsh
+        run: |
+          mkdir opencv\build
+          cd opencv\build
+          cmake -G "Visual Studio 17 2022" -A x64 `
+            -D CMAKE_BUILD_TYPE=Release `
+            -D CMAKE_INSTALL_PREFIX="$PWD\install" `
+            -D BUILD_opencv_world=ON `
+            -D OPENCV_EXTRA_MODULES_PATH="$PWD\..\..\opencv_contrib\modules" `
+            -D WITH_CUDA=ON `
+            -D CUDA_ARCH_BIN=7.5 `
+            -D CUDA_ARCH_PTX= `
+            -D CUDA_FAST_MATH=ON `
+            -D ENABLE_FAST_MATH=ON `
+            -D WITH_CUDNN=OFF `
+            -D OPENCV_DNN_CUDA=OFF `
+            -D BUILD_TESTS=OFF `
+            -D BUILD_PERF_TESTS=OFF `
+            -D BUILD_EXAMPLES=OFF `
+            -D BUILD_opencv_python3=OFF `
+            ..
+
+      - name: Build + install
+        shell: pwsh
+        run: |
+          cd opencv\build
+          cmake --build . --config Release --target INSTALL -- /m
+
+      - name: Upload opencv_world500.dll / .lib
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencv_world500-cuda-win64
+          path: |
+            opencv/build/install/x64/vc17/bin/opencv_world500.dll
+            opencv/build/install/x64/vc17/lib/opencv_world500.lib
+          if-no-files-found: error
