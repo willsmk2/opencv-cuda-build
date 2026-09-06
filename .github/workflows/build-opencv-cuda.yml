@@ -16,23 +16,14 @@ jobs:
       - name: Setup NASM
         uses: ilammy/setup-nasm@v1
 
-      # Use official CUDA action (handles download, caching, and installation)
       - name: Install CUDA Toolkit 12.4
         uses: Jimver/cuda-toolkit@v0.2.16
         with:
           cuda: '12.4.0'
           method: 'network'
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "npp", "npp_dev"]'
-          # Uncomment if you want to use a local cache (the action already caches by default)
-          # use-github-cache: true
 
-      - name: Verify CUDA installation
-        shell: pwsh
-        run: |
-          nvcc --version
-          echo "CUDA_PATH=$env:CUDA_PATH"
-
-      - name: Patch opencv_contrib (missing 'ulong' typedef on Windows/CUDA 12.4)
+      - name: Patch opencv_contrib (missing 'ulong' typedef on Windows)
         shell: pwsh
         run: |
           $commonHpp = "opencv_contrib/modules/cudev/include/opencv2/cudev/common.hpp"
@@ -40,12 +31,22 @@ jobs:
           $original = Get-Content $commonHpp -Raw
           Set-Content -Path $commonHpp -Value ($patch + $original) -NoNewline
 
-      - name: Patch opencv_contrib (missing 64-bit VecTraits/MakeVec on Windows)
+      - name: Patch opencv_contrib (add longlong/ulonglong typedefs and trait specializations)
         shell: pwsh
         run: |
           $vecTraits = "opencv_contrib/modules/cudev/include/opencv2/cudev/util/vec_traits.hpp"
-          $content = Get-Content $vecTraits -Raw
 
+          # 1. Prepend typedefs for 64‑bit types on Windows
+          $typedefPatch = @"
+          #if defined(_WIN32)
+          typedef long long longlong;
+          typedef unsigned long long ulonglong;
+          #endif
+          "@
+          $content = Get-Content $vecTraits -Raw
+          $content = $typedefPatch + "`n" + $content
+
+          # 2. Add specializations after existing 'ulong' lines
           $content = $content.Replace(
             "CV_CUDEV_MAKE_VEC_INST(ulong)",
             "CV_CUDEV_MAKE_VEC_INST(ulong)`n#if defined(_WIN32)`nCV_CUDEV_MAKE_VEC_INST(longlong)`nCV_CUDEV_MAKE_VEC_INST(ulonglong)`n#endif"
