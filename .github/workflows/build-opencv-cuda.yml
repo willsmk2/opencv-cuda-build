@@ -1,48 +1,3 @@
-name: Build opencv_world500 (CUDA 12.4, GTX 1660 / sm_75)
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-2022
-
-    steps:
-
-      # ============================================================
-      # 1. OpenCV 5.0.0 + contrib 5.0.0
-      # ============================================================
-      - name: Clone OpenCV 5.0.0 + opencv_contrib
-        shell: pwsh
-        run: |
-          git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv.git
-          git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv_contrib.git
-
-      # ============================================================
-      # 2. Initialize MSVC environment
-      #
-      # This makes sure CMake/NVCC use the Visual Studio toolchain
-      # instead of accidentally inheriting another linker/compiler.
-      # ============================================================
-      - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      # ============================================================
-      # 3. NASM
-      # ============================================================
-      - name: Setup NASM
-        uses: ilammy/setup-nasm@v1
-
-      # ============================================================
-      # 4. Cache CUDA installer
-      # ============================================================
-      - name: Cache CUDA installer
-        uses: actions/cache@v4
-        with:
-          path: cuda_installer.exe
-          key: cuda-12.4.0-network-installer
 
       # ============================================================
       # 5. Install CUDA 12.4
@@ -50,53 +5,159 @@ jobs:
       - name: Install CUDA Toolkit
         shell: pwsh
         run: |
-          if (-not (Test-Path "cuda_installer.exe")) {
-            Write-Host "Downloading CUDA 12.4..."
+          $ErrorActionPreference = "Stop"
 
-            curl.exe -L `
-              -o cuda_installer.exe `
-              https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+          $installer = Join-Path $PWD "cuda_installer.exe"
+
+          # ----------------------------------------------------------
+          # Download CUDA 12.4 network installer
+          # ----------------------------------------------------------
+          if (-not (Test-Path $installer)) {
+
+            Write-Host "Downloading CUDA 12.4 network installer..."
+
+            curl.exe `
+              -fL `
+              --retry 5 `
+              --retry-delay 5 `
+              -o "$installer" `
+              "https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe"
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to download CUDA 12.4 installer. curl exit code: $LASTEXITCODE"
+            }
           }
           else {
             Write-Host "Using cached CUDA installer."
           }
 
+          # ----------------------------------------------------------
+          # Validate installer
+          # ----------------------------------------------------------
+          if (-not (Test-Path $installer)) {
+            throw "CUDA installer was not downloaded."
+          }
+
+          $size = (Get-Item $installer).Length
+
+          Write-Host ""
+          Write-Host "CUDA installer size: $size bytes"
+
+          if ($size -lt 1000000) {
+            throw "CUDA installer is suspiciously small."
+          }
+
+          # ----------------------------------------------------------
+          # Remove incomplete CUDA installation if present
+          # ----------------------------------------------------------
+          if (Test-Path $cudaPath) {
+            Write-Host "Existing CUDA 12.4 directory detected."
+
+            if (Test-Path "$cudaPath\bin\nvcc.exe") {
+              Write-Host "CUDA 12.4 already installed."
+            }
+            else {
+              Write-Host "CUDA 12.4 installation appears incomplete."
+              Write-Host "Removing incomplete installation..."
+
+              Remove-Item `
+                -Path $cudaPath `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+            }
+          }
+
+          # ----------------------------------------------------------
+          # Install only the components required by OpenCV CUDA.
+          #
+          # These are official CUDA 12.4 Windows subpackage names.
+          # ----------------------------------------------------------
           $components = @(
             "nvcc_12.4",
             "cudart_12.4",
-            "cudart_dev_12.4",
             "cublas_12.4",
             "cublas_dev_12.4",
             "cufft_12.4",
             "cufft_dev_12.4",
             "npp_12.4",
-            "npp_dev_12.4"
+            "npp_dev_12.4",
+            "visual_studio_integration_12.4"
           )
 
-          Start-Process `
-            -FilePath ".\cuda_installer.exe" `
-            -ArgumentList "-s $($components -join ' ')" `
+          $arguments = @(
+            "-s"
+            "-n"
+          ) + $components
+
+          Write-Host ""
+          Write-Host "Installing CUDA 12.4..."
+          Write-Host ""
+          Write-Host "Components:"
+          $components | ForEach-Object {
+            Write-Host "  $_"
+          }
+
+          # ----------------------------------------------------------
+          # Start installer and capture exit code.
+          # ----------------------------------------------------------
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList $arguments `
             -Wait `
+            -PassThru `
             -NoNewWindow
 
-          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+          Write-Host ""
+          Write-Host "CUDA installer exit code: $($process.ExitCode)"
 
-          if (-not (Test-Path "$cudaPath\bin\nvcc.exe")) {
+          if ($process.ExitCode -ne 0) {
+            throw "CUDA 12.4 installer failed with exit code $($process.ExitCode)."
+          }
+
+          # ----------------------------------------------------------
+          # Verify installation
+          # ----------------------------------------------------------
+          Write-Host ""
+          Write-Host "Checking CUDA installation..."
+
+          $nvcc = "$cudaPath\bin\nvcc.exe"
+          $cudart = "$cudaPath\lib\x64\cudart.lib"
+          $cublas = "$cudaPath\lib\x64\cublas.lib"
+          $cufft = "$cudaPath\lib\x64\cufft.lib"
+
+          if (-not (Test-Path $nvcc)) {
+            Write-Host ""
+            Write-Host "CUDA installation directory contents:"
+            
+            if (Test-Path $cudaPath) {
+              Get-ChildItem $cudaPath -Force |
+                Select-Object Name, FullName
+            }
+            else {
+              Write-Host "CUDA directory does not exist:"
+              Write-Host $cudaPath
+            }
+
             throw "CUDA installation failed: nvcc.exe not found."
           }
 
-          if (-not (Test-Path "$cudaPath\lib\x64\cudart.lib")) {
+          if (-not (Test-Path $cudart)) {
             throw "CUDA installation failed: cudart.lib not found."
           }
 
-          if (-not (Test-Path "$cudaPath\lib\x64\cublas.lib")) {
+          if (-not (Test-Path $cublas)) {
             throw "CUDA installation failed: cublas.lib not found."
           }
 
-          if (-not (Test-Path "$cudaPath\lib\x64\cufft.lib")) {
+          if (-not (Test-Path $cufft)) {
             throw "CUDA installation failed: cufft.lib not found."
           }
 
+          # ----------------------------------------------------------
+          # Export environment
+          # ----------------------------------------------------------
           "CUDA_PATH=$cudaPath" |
             Out-File $env:GITHUB_ENV -Append
 
@@ -106,705 +167,27 @@ jobs:
           "$cudaPath\bin" |
             Out-File $env:GITHUB_PATH -Append
 
-          Write-Host "CUDA 12.4 installed successfully."
-
-      # ============================================================
-      # 6. Verify compiler/linker environment
-      # ============================================================
-      - name: Verify MSVC + CUDA toolchain
-        shell: pwsh
-        run: |
+          # ----------------------------------------------------------
+          # Final verification
+          # ----------------------------------------------------------
           Write-Host ""
           Write-Host "=============================================="
-          Write-Host "TOOLCHAIN"
+          Write-Host "CUDA 12.4 INSTALLATION SUCCESS"
           Write-Host "=============================================="
 
           Write-Host ""
-          Write-Host "cl.exe:"
-          where.exe cl.exe
+          Write-Host "nvcc:"
+          & $nvcc --version
 
           Write-Host ""
-          Write-Host "link.exe:"
-          where.exe link.exe
-
-          Write-Host ""
-          Write-Host "nvcc.exe:"
-          where.exe nvcc.exe
-
-          Write-Host ""
-          Write-Host "CUDA version:"
-          nvcc.exe --version
-
-          Write-Host ""
-          Write-Host "MSVC version:"
-          cl.exe 2>&1 | Select-Object -First 2
-
-          Write-Host ""
-          Write-Host "=============================================="
-
-      # ============================================================
-      # 7. Patch Windows ulong problem
-      # ============================================================
-      - name: Patch CUDA ulong
-        shell: pwsh
-        run: |
-          $file = "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp"
-
-          if (-not (Test-Path $file)) {
-            throw "common.hpp not found."
-          }
-
-          $content = Get-Content $file -Raw
-
-          if ($content -notmatch "typedef unsigned long ulong;") {
-
-            $patch = @"
-          #if defined(_WIN32)
-          typedef unsigned long ulong;
-          #endif
-
-          "@
-
-            Set-Content `
-              -Path $file `
-              -Value ($patch + $content) `
-              -NoNewline
-
-            Write-Host "Added Windows ulong typedef."
-          }
-          else {
-            Write-Host "ulong typedef already exists."
-          }
-
-      # ============================================================
-      # 8. Complete OpenCV 5.0.0 CUDA 64-bit cudev patch
-      # ============================================================
-      - name: Patch CUDA 64-bit vector traits
-        shell: pwsh
-        run: |
-          $file = "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp"
-
-          if (-not (Test-Path $file)) {
-            throw "vec_traits.hpp not found."
-          }
-
-          $content = Get-Content $file -Raw
-
-          # Remove previous version of our patch if present.
-          $content = [regex]::Replace(
-            $content,
-            '(?s)// OPENCV_CUDEV_64BIT_FIX.*?// END OPENCV_CUDEV_64BIT_FIX\s*',
-            ''
-          )
-
-          if ($content -match "OPENCV_CUDEV_64BIT_FIX") {
-            Write-Host "64-bit patch already present."
-            Set-Content -Path $file -Value $content -NoNewline
-            exit 0
-          }
-
-          $needle = "CV_CUDEV_VEC_TRAITS_INST(ulong)"
-
-          if (-not $content.Contains($needle)) {
-            throw "Could not find CV_CUDEV_VEC_TRAITS_INST(ulong)."
-          }
-
-          $patch = @'
-
-          // ==========================================================
-          // OPENCV_CUDEV_64BIT_FIX
-          // ==========================================================
-
-          template <> struct MakeVec<int64_t, 1>
-          {
-              typedef int64_t type;
-          };
-
-          template <> struct MakeVec<int64_t, 2>
-          {
-              typedef longlong2 type;
-          };
-
-          template <> struct MakeVec<int64_t, 3>
-          {
-              typedef longlong3 type;
-          };
-
-          template <> struct MakeVec<int64_t, 4>
-          {
-              typedef longlong4 type;
-          };
-
-
-          template <> struct MakeVec<uint64_t, 1>
-          {
-              typedef uint64_t type;
-          };
-
-          template <> struct MakeVec<uint64_t, 2>
-          {
-              typedef ulonglong2 type;
-          };
-
-          template <> struct MakeVec<uint64_t, 3>
-          {
-              typedef ulonglong3 type;
-          };
-
-          template <> struct MakeVec<uint64_t, 4>
-          {
-              typedef ulonglong4 type;
-          };
-
-
-          template <>
-          struct VecTraits<int64_t>
-          {
-              typedef int64_t elem_type;
-
-              enum
-              {
-                  cn = 1
-              };
-
-              static __host__ __device__ __forceinline__
-              int64_t all(int64_t v)
-              {
-                  return v;
-              }
-
-              static __host__ __device__ __forceinline__
-              int64_t make(int64_t v)
-              {
-                  return v;
-              }
-
-              static __host__ __device__ __forceinline__
-              int64_t make(const int64_t* v)
-              {
-                  return *v;
-              }
-          };
-
-
-          template <>
-          struct VecTraits<uint64_t>
-          {
-              typedef uint64_t elem_type;
-
-              enum
-              {
-                  cn = 1
-              };
-
-              static __host__ __device__ __forceinline__
-              uint64_t all(uint64_t v)
-              {
-                  return v;
-              }
-
-              static __host__ __device__ __forceinline__
-              uint64_t make(uint64_t v)
-              {
-                  return v;
-              }
-
-              static __host__ __device__ __forceinline__
-              uint64_t make(const uint64_t* v)
-              {
-                  return *v;
-              }
-          };
-
-
-          template <>
-          struct VecTraits<longlong1>
-          {
-              typedef int64_t elem_type;
-              enum { cn = 1 };
-
-              static __host__ __device__ __forceinline__
-              longlong1 all(int64_t v)
-              {
-                  return make_longlong1(v);
-              }
-
-              static __host__ __device__ __forceinline__
-              longlong1 make(int64_t v)
-              {
-                  return make_longlong1(v);
-              }
-
-              static __host__ __device__ __forceinline__
-              longlong1 make(const int64_t* v)
-              {
-                  return make_longlong1(v[0]);
-              }
-          };
-
-
-          template <>
-          struct VecTraits<longlong2>
-          {
-              typedef int64_t elem_type;
-              enum { cn = 2 };
-
-              static __host__ __device__ __forceinline__
-              longlong2 all(int64_t v)
-              {
-                  return make_longlong2(v, v);
-              }
-
-              static __host__ __device__ __forceinline__
-              longlong2 make(int64_t x, int64_t y)
-              {
-                  return make_longlong2(x, y);
-              }
-
-              static __host__ __device__ __forceinline__
-              longlong2 make(const int64_t* v)
-              {
-                  return make_longlong2(v[0], v[1]);
-              }
-          };
-
-
-          template <>
-          struct VecTraits<longlong3>
-          {
-              typedef int64_t elem_type;
-              enum { cn = 3 };
-
-              static __host__ __device__ __forceinline__
-              longlong3 all(int64_t v)
-              {
-                  return make_longlong3(v, v, v);
-              }
-
-              static __host__ __device__ __forceinline__
-              longlong3 make(int64_t x, int64_t y, int64_t z)
-              {
-                  return make_longlong3(x, y, z);
-              }
-
-              static __host__ __device__ __forceinline__
-              longlong3 make(const int64_t* v)
-              {
-                  return make_longlong3(v[0], v[1], v[2]);
-              }
-          };
-
-
-          template <>
-          struct VecTraits<longlong4>
-          {
-              typedef int64_t elem_type;
-              enum { cn = 4 };
-
-              static __host__ __device__ __forceinline__
-              longlong4 all(int64_t v)
-              {
-                  return make_longlong4(v, v, v, v);
-              }
-
-              static __host__ __device__ __forceinline__
-              longlong4 make(
-                  int64_t x,
-                  int64_t y,
-                  int64_t z,
-                  int64_t w)
-              {
-                  return make_longlong4(x, y, z, w);
-              }
-
-              static __host__ __device__ __forceinline__
-              longlong4 make(const int64_t* v)
-              {
-                  return make_longlong4(
-                      v[0],
-                      v[1],
-                      v[2],
-                      v[3]
-                  );
-              }
-          };
-
-
-          template <>
-          struct VecTraits<ulonglong1>
-          {
-              typedef uint64_t elem_type;
-              enum { cn = 1 };
-
-              static __host__ __device__ __forceinline__
-              ulonglong1 all(uint64_t v)
-              {
-                  return make_ulonglong1(v);
-              }
-
-              static __host__ __device__ __forceinline__
-              ulonglong1 make(uint64_t v)
-              {
-                  return make_ulonglong1(v);
-              }
-
-              static __host__ __device__ __forceinline__
-              ulonglong1 make(const uint64_t* v)
-              {
-                  return make_ulonglong1(v[0]);
-              }
-          };
-
-
-          template <>
-          struct VecTraits<ulonglong2>
-          {
-              typedef uint64_t elem_type;
-              enum { cn = 2 };
-
-              static __host__ __device__ __forceinline__
-              ulonglong2 all(uint64_t v)
-              {
-                  return make_ulonglong2(v, v);
-              }
-
-              static __host__ __device__ __forceinline__
-              ulonglong2 make(uint64_t x, uint64_t y)
-              {
-                  return make_ulonglong2(x, y);
-              }
-
-              static __host__ __device__ __forceinline__
-              ulonglong2 make(const uint64_t* v)
-              {
-                  return make_ulonglong2(v[0], v[1]);
-              }
-          };
-
-
-          template <>
-          struct VecTraits<ulonglong3>
-          {
-              typedef uint64_t elem_type;
-              enum { cn = 3 };
-
-              static __host__ __device__ __forceinline__
-              ulonglong3 all(uint64_t v)
-              {
-                  return make_ulonglong3(v, v, v);
-              }
-
-              static __host__ __device__ __forceinline__
-              ulonglong3 make(
-                  uint64_t x,
-                  uint64_t y,
-                  uint64_t z)
-              {
-                  return make_ulonglong3(x, y, z);
-              }
-
-              static __host__ __device__ __forceinline__
-              ulonglong3 make(const uint64_t* v)
-              {
-                  return make_ulonglong3(
-                      v[0],
-                      v[1],
-                      v[2]
-                  );
-              }
-          };
-
-
-          template <>
-          struct VecTraits<ulonglong4>
-          {
-              typedef uint64_t elem_type;
-              enum { cn = 4 };
-
-              static __host__ __device__ __forceinline__
-              ulonglong4 all(uint64_t v)
-              {
-                  return make_ulonglong4(v, v, v, v);
-              }
-
-              static __host__ __device__ __forceinline__
-              ulonglong4 make(
-                  uint64_t x,
-                  uint64_t y,
-                  uint64_t z,
-                  uint64_t w)
-              {
-                  return make_ulonglong4(x, y, z, w);
-              }
-
-              static __host__ __device__ __forceinline__
-              ulonglong4 make(const uint64_t* v)
-              {
-                  return make_ulonglong4(
-                      v[0],
-                      v[1],
-                      v[2],
-                      v[3]
-                  );
-              }
-          };
-
-          // ==========================================================
-          // END OPENCV_CUDEV_64BIT_FIX
-          // ==========================================================
-          '@
-
-          $content = $content.Replace(
-              $needle,
-              $needle + $patch
-          )
-
-          Set-Content `
-              -Path $file `
-              -Value $content `
-              -NoNewline
-
-          Write-Host "64-bit CUDA cudev patch installed."
-
-      # ============================================================
-      # 9. Verify source patches
-      # ============================================================
-      - name: Verify CUDA source patches
-        shell: pwsh
-        run: |
-          $common = Get-Content `
-            "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp" `
-            -Raw
-
-          $traits = Get-Content `
-            "opencv_contrib\modules\cudev\include\opencv2\cudev\util\vec_traits.hpp" `
-            -Raw
-
-          if ($common -notmatch "typedef unsigned long ulong;") {
-            throw "Missing ulong typedef."
-          }
-
-          $required = @(
-            "MakeVec<int64_t, 1>",
-            "MakeVec<int64_t, 2>",
-            "MakeVec<int64_t, 3>",
-            "MakeVec<int64_t, 4>",
-            "MakeVec<uint64_t, 1>",
-            "MakeVec<uint64_t, 2>",
-            "MakeVec<uint64_t, 3>",
-            "MakeVec<uint64_t, 4>",
-            "VecTraits<int64_t>",
-            "VecTraits<uint64_t>",
-            "VecTraits<longlong1>",
-            "VecTraits<longlong2>",
-            "VecTraits<longlong3>",
-            "VecTraits<longlong4>",
-            "VecTraits<ulonglong1>",
-            "VecTraits<ulonglong2>",
-            "VecTraits<ulonglong3>",
-            "VecTraits<ulonglong4>"
-          )
-
-          foreach ($item in $required) {
-            if ($traits -notmatch [regex]::Escape($item)) {
-              throw "Missing required definition: $item"
-            }
-          }
-
-          Write-Host "CUDA/OpenCV source patches verified."
-
-      # ============================================================
-      # 10. Configure OpenCV
-      #
-      # IMPORTANT:
-      # CUDA_USE_STATIC_CUDA_RUNTIME=OFF
-      #
-      # This prevents OpenCV/CMake from trying to feed
-      # cudart_static into the final MSVC link in the problematic
-      # configuration seen in the previous build.
-      # ============================================================
-      - name: Configure with CMake
-        shell: pwsh
-        run: |
-          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-          $cudaBin = "$cudaPath\bin"
-          $cudaLib = "$cudaPath\lib\x64"
-
-          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-
-          if (-not (Test-Path $vsWhere)) {
-            throw "vswhere.exe not found."
-          }
-
-          $vsInstall = & $vsWhere `
-            -latest `
-            -products * `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath
-
-          if (-not $vsInstall) {
-            throw "Visual Studio installation with C++ tools not found."
-          }
-
-          $msvcTools = Get-ChildItem `
-            "$vsInstall\VC\Tools\MSVC" `
-            -Directory |
-            Sort-Object Name -Descending |
-            Select-Object -First 1
-
-          if (-not $msvcTools) {
-            throw "MSVC tools directory not found."
-          }
-
-          $clPath = "$($msvcTools.FullName)\bin\Hostx64\x64\cl.exe"
-          $linkPath = "$($msvcTools.FullName)\bin\Hostx64\x64\link.exe"
-
-          if (-not (Test-Path $clPath)) {
-            throw "MSVC cl.exe not found: $clPath"
-          }
-
-          if (-not (Test-Path $linkPath)) {
-            throw "MSVC link.exe not found: $linkPath"
-          }
-
-          Write-Host ""
-          Write-Host "MSVC compiler:"
-          Write-Host $clPath
-
-          Write-Host ""
-          Write-Host "MSVC linker:"
-          Write-Host $linkPath
-
-          Write-Host ""
-          Write-Host "CUDA:"
+          Write-Host "CUDA path:"
           Write-Host $cudaPath
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            "opencv\build" | Out-Null
-
-          Set-Location "opencv\build"
-
-          cmake `
-            -G "Visual Studio 17 2022" `
-            -A x64 `
-            -T host=x64 `
-            -D CMAKE_BUILD_TYPE=Release `
-            -D CMAKE_C_COMPILER="$clPath" `
-            -D CMAKE_CXX_COMPILER="$clPath" `
-            -D CMAKE_CUDA_COMPILER="$cudaBin\nvcc.exe" `
-            -D CMAKE_CUDA_HOST_COMPILER="$clPath" `
-            -D CUDA_TOOLKIT_ROOT_DIR="$cudaPath" `
-            -D CUDA_USE_STATIC_CUDA_RUNTIME=OFF `
-            -D CUDA_ARCH_BIN="7.5" `
-            -D CUDA_ARCH_PTX= `
-            -D CUDA_FAST_MATH=ON `
-            -D ENABLE_FAST_MATH=ON `
-            -D WITH_CUDA=ON `
-            -D WITH_CUBLAS=ON `
-            -D WITH_CUFFT=ON `
-            -D WITH_NPP=ON `
-            -D WITH_CUDNN=OFF `
-            -D OPENCV_DNN_CUDA=OFF `
-            -D BUILD_opencv_world=ON `
-            -D OPENCV_EXTRA_MODULES_PATH="$PWD\..\..\opencv_contrib\modules" `
-            -D CMAKE_INSTALL_PREFIX="$PWD\install" `
-            -D BUILD_TESTS=OFF `
-            -D BUILD_PERF_TESTS=OFF `
-            -D BUILD_EXAMPLES=OFF `
-            -D BUILD_opencv_python3=OFF `
-            ..
-
-      # ============================================================
-      # 11. Inspect CMake CUDA configuration BEFORE compiling
-      #
-      # This catches the exact problem from the previous build.
-      # ============================================================
-      - name: Verify CMake CUDA configuration
-        shell: pwsh
-        run: |
-          Set-Location "opencv\build"
-
-          $cache = Get-Content "CMakeCache.txt" -Raw
-
           Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "CUDA CMAKE CONFIGURATION"
-          Write-Host "=============================================="
-
-          Select-String `
-            -Path "CMakeCache.txt" `
-            -Pattern "CUDA_TOOLKIT_ROOT_DIR|CUDA_USE_STATIC_CUDA_RUNTIME|CUDA_ARCH_BIN|CUDA_ARCH_PTX|CUDA_CUDART_LIBRARY|CUDA_cudart_static_LIBRARY|CUDA_CUBLAS|CUDA_cufft" |
-            ForEach-Object {
-              Write-Host $_.Line
-            }
+          Write-Host "cudart.lib : OK"
+          Write-Host "cublas.lib : OK"
+          Write-Host "cufft.lib  : OK"
 
           Write-Host ""
           Write-Host "=============================================="
 
-          if ($cache -match "CUDA_USE_STATIC_CUDA_RUNTIME:BOOL=ON") {
-            throw "CUDA_USE_STATIC_CUDA_RUNTIME is still ON."
-          }
-
-          if ($cache -match "CUDA_ARCH_BIN:STRING=7\.5") {
-            Write-Host "CUDA architecture 7.5: OK"
-          }
-          else {
-            throw "CUDA_ARCH_BIN is not configured for 7.5."
-          }
-
-          if ($cache -notmatch "CUDA_TOOLKIT_ROOT_DIR:PATH=.*CUDA\\v12\.4") {
-            Write-Host "WARNING: CUDA_TOOLKIT_ROOT_DIR cache entry was not exactly as expected."
-          }
-
-      # ============================================================
-      # 12. Build
-      # ============================================================
-      - name: Build + install
-        shell: pwsh
-        run: |
-          Set-Location "opencv\build"
-
-          cmake `
-            --build . `
-            --config Release `
-            --target INSTALL `
-            --parallel 2
-
-      # ============================================================
-      # 13. Verify final binaries
-      # ============================================================
-      - name: Verify OpenCV binaries
-        shell: pwsh
-        run: |
-          $dll = "opencv\build\install\x64\vc17\bin\opencv_world500.dll"
-          $lib = "opencv\build\install\x64\vc17\lib\opencv_world500.lib"
-
-          if (-not (Test-Path $dll)) {
-            throw "opencv_world500.dll was not produced."
-          }
-
-          if (-not (Test-Path $lib)) {
-            throw "opencv_world500.lib was not produced."
-          }
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "SUCCESS"
-          Write-Host "=============================================="
-          Write-Host "DLL: $dll"
-          Write-Host "LIB: $lib"
-          Write-Host "=============================================="
-
-      # ============================================================
-      # 14. Upload
-      # ============================================================
-      - name: Upload OpenCV CUDA build
-        uses: actions/upload-artifact@v4
-        with:
-          name: opencv_world500-cuda-win64
-          path: |
-            opencv/build/install/x64/vc17/bin/opencv_world500.dll
-            opencv/build/install/x64/vc17/lib/opencv_world500.lib
-          if-no-files-found: error
