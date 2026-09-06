@@ -53,11 +53,8 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "Installing CUDA toolkit (default components)..."
-          $log = "cuda_install.log"
-          # Run installer silently; capture output and exit code
-          $process = Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $log -RedirectStandardError $log
+          $process = Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s" -Wait -PassThru -NoNewWindow
           Write-Host "CUDA installer exit code: $($process.ExitCode)"
-          Get-Content $log -ErrorAction SilentlyContinue
 
           $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
           if (-not (Test-Path $cudaPath)) {
