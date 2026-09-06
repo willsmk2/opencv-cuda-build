@@ -21,7 +21,7 @@ jobs:
         with:
           cuda: '12.4.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "npp", "npp_dev"]'
+          sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "cufft", "cufft_dev", "npp", "npp_dev"]'
 
       - name: Patch opencv_contrib (missing 'ulong' typedef on Windows)
         shell: pwsh
@@ -36,7 +36,6 @@ jobs:
         run: |
           $vecTraits = "opencv_contrib/modules/cudev/include/opencv2/cudev/util/vec_traits.hpp"
 
-          # 1. Prepend typedefs for 64‑bit types on Windows
           $typedefPatch = @"
           #if defined(_WIN32)
           typedef long long longlong;
@@ -46,7 +45,6 @@ jobs:
           $content = Get-Content $vecTraits -Raw
           $content = $typedefPatch + "`n" + $content
 
-          # 2. Add specializations after existing 'ulong' lines
           $content = $content.Replace(
             "CV_CUDEV_MAKE_VEC_INST(ulong)",
             "CV_CUDEV_MAKE_VEC_INST(ulong)`n#if defined(_WIN32)`nCV_CUDEV_MAKE_VEC_INST(longlong)`nCV_CUDEV_MAKE_VEC_INST(ulonglong)`n#endif"
