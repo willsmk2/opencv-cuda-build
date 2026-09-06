@@ -49,15 +49,20 @@ jobs:
             Write-Host "Using cached CUDA installer."
           }
 
-      - name: Install CUDA Toolkit (components including cudart_dev)
+      - name: Install CUDA Toolkit (full default install)
         shell: pwsh
         run: |
-          $components = "nvcc_12.4 cudart_12.4 cudart_dev_12.4 cublas_12.4 cublas_dev_12.4 cufft_12.4 cufft_dev_12.4 npp_12.4 npp_dev_12.4"
-          Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s $components" -Wait -NoNewWindow
-          # Verify installation
+          Write-Host "Installing CUDA toolkit (default components)..."
+          $log = "cuda_install.log"
+          # Run installer silently; capture output and exit code
+          $process = Start-Process -FilePath .\cuda_installer.exe -ArgumentList "-s" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $log -RedirectStandardError $log
+          Write-Host "CUDA installer exit code: $($process.ExitCode)"
+          Get-Content $log -ErrorAction SilentlyContinue
+
           $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
           if (-not (Test-Path $cudaPath)) {
             Write-Error "CUDA installation failed. $cudaPath not found."
+            exit 1
           } else {
             echo "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
             echo "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
