@@ -1,193 +1,96 @@
+name: Build opencv_world500 (CUDA, GTX 1660 / sm_75)
 
-      # ============================================================
-      # 5. Install CUDA 12.4
-      # ============================================================
-      - name: Install CUDA Toolkit
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Clone OpenCV 5.x + opencv_contrib
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          git clone --branch 5.x --depth 1 https://github.com/opencv/opencv.git
+          git clone --branch 5.x --depth 1 https://github.com/opencv/opencv_contrib.git
 
-          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-          $installer = Join-Path $PWD "cuda_installer.exe"
+      - name: Setup NASM
+        uses: ilammy/setup-nasm@v1
 
-          # ----------------------------------------------------------
-          # Download CUDA 12.4 network installer
-          # ----------------------------------------------------------
-          if (-not (Test-Path $installer)) {
+      # Use official CUDA action (handles download, caching, and installation)
+      - name: Install CUDA Toolkit 12.4
+        uses: Jimver/cuda-toolkit@v0.2.16
+        with:
+          cuda: '12.4.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "npp", "npp_dev"]'
+          # Uncomment if you want to use a local cache (the action already caches by default)
+          # use-github-cache: true
 
-            Write-Host "Downloading CUDA 12.4 network installer..."
+      - name: Verify CUDA installation
+        shell: pwsh
+        run: |
+          nvcc --version
+          echo "CUDA_PATH=$env:CUDA_PATH"
 
-            curl.exe `
-              -fL `
-              --retry 5 `
-              --retry-delay 5 `
-              -o "$installer" `
-              "https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe"
+      - name: Patch opencv_contrib (missing 'ulong' typedef on Windows/CUDA 12.4)
+        shell: pwsh
+        run: |
+          $commonHpp = "opencv_contrib/modules/cudev/include/opencv2/cudev/common.hpp"
+          $patch = "#if defined(_WIN32)`ntypedef unsigned long ulong;`n#endif`n"
+          $original = Get-Content $commonHpp -Raw
+          Set-Content -Path $commonHpp -Value ($patch + $original) -NoNewline
 
-            if ($LASTEXITCODE -ne 0) {
-              throw "Failed to download CUDA 12.4 installer. curl exit code: $LASTEXITCODE"
-            }
-          }
-          else {
-            Write-Host "Using cached CUDA installer."
-          }
+      - name: Patch opencv_contrib (missing 64-bit VecTraits/MakeVec on Windows)
+        shell: pwsh
+        run: |
+          $vecTraits = "opencv_contrib/modules/cudev/include/opencv2/cudev/util/vec_traits.hpp"
+          $content = Get-Content $vecTraits -Raw
 
-          # ----------------------------------------------------------
-          # Validate installer
-          # ----------------------------------------------------------
-          if (-not (Test-Path $installer)) {
-            throw "CUDA installer was not downloaded."
-          }
-
-          $size = (Get-Item $installer).Length
-
-          Write-Host ""
-          Write-Host "CUDA installer size: $size bytes"
-
-          if ($size -lt 1000000) {
-            throw "CUDA installer is suspiciously small."
-          }
-
-          # ----------------------------------------------------------
-          # Remove incomplete CUDA installation if present
-          # ----------------------------------------------------------
-          if (Test-Path $cudaPath) {
-            Write-Host "Existing CUDA 12.4 directory detected."
-
-            if (Test-Path "$cudaPath\bin\nvcc.exe") {
-              Write-Host "CUDA 12.4 already installed."
-            }
-            else {
-              Write-Host "CUDA 12.4 installation appears incomplete."
-              Write-Host "Removing incomplete installation..."
-
-              Remove-Item `
-                -Path $cudaPath `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue
-            }
-          }
-
-          # ----------------------------------------------------------
-          # Install only the components required by OpenCV CUDA.
-          #
-          # These are official CUDA 12.4 Windows subpackage names.
-          # ----------------------------------------------------------
-          $components = @(
-            "nvcc_12.4",
-            "cudart_12.4",
-            "cublas_12.4",
-            "cublas_dev_12.4",
-            "cufft_12.4",
-            "cufft_dev_12.4",
-            "npp_12.4",
-            "npp_dev_12.4",
-            "visual_studio_integration_12.4"
+          $content = $content.Replace(
+            "CV_CUDEV_MAKE_VEC_INST(ulong)",
+            "CV_CUDEV_MAKE_VEC_INST(ulong)`n#if defined(_WIN32)`nCV_CUDEV_MAKE_VEC_INST(longlong)`nCV_CUDEV_MAKE_VEC_INST(ulonglong)`n#endif"
+          )
+          $content = $content.Replace(
+            "CV_CUDEV_VEC_TRAITS_INST(ulong)",
+            "CV_CUDEV_VEC_TRAITS_INST(ulong)`n#if defined(_WIN32)`nCV_CUDEV_VEC_TRAITS_INST(longlong)`nCV_CUDEV_VEC_TRAITS_INST(ulonglong)`n#endif"
           )
 
-          $arguments = @(
-            "-s"
-            "-n"
-          ) + $components
+          Set-Content -Path $vecTraits -Value $content -NoNewline
 
-          Write-Host ""
-          Write-Host "Installing CUDA 12.4..."
-          Write-Host ""
-          Write-Host "Components:"
-          $components | ForEach-Object {
-            Write-Host "  $_"
-          }
+      - name: Configure with CMake
+        shell: pwsh
+        run: |
+          mkdir opencv/build
+          cd opencv/build
+          cmake -G "Visual Studio 17 2022" -A x64 `
+            -D CMAKE_BUILD_TYPE=Release `
+            -D CMAKE_INSTALL_PREFIX="$PWD/install" `
+            -D BUILD_opencv_world=ON `
+            -D OPENCV_EXTRA_MODULES_PATH="$env:GITHUB_WORKSPACE/opencv_contrib/modules" `
+            -D WITH_CUDA=ON `
+            -D CUDA_ARCH_BIN=7.5 `
+            -D CUDA_ARCH_PTX= `
+            -D CUDA_FAST_MATH=ON `
+            -D ENABLE_FAST_MATH=ON `
+            -D WITH_CUDNN=OFF `
+            -D OPENCV_DNN_CUDA=OFF `
+            -D BUILD_TESTS=OFF `
+            -D BUILD_PERF_TESTS=OFF `
+            -D BUILD_EXAMPLES=OFF `
+            -D BUILD_opencv_python3=OFF `
+            ..
 
-          # ----------------------------------------------------------
-          # Start installer and capture exit code.
-          # ----------------------------------------------------------
-          $process = Start-Process `
-            -FilePath $installer `
-            -ArgumentList $arguments `
-            -Wait `
-            -PassThru `
-            -NoNewWindow
+      - name: Build and install
+        shell: pwsh
+        run: |
+          cd opencv/build
+          cmake --build . --config Release --target INSTALL --parallel
 
-          Write-Host ""
-          Write-Host "CUDA installer exit code: $($process.ExitCode)"
-
-          if ($process.ExitCode -ne 0) {
-            throw "CUDA 12.4 installer failed with exit code $($process.ExitCode)."
-          }
-
-          # ----------------------------------------------------------
-          # Verify installation
-          # ----------------------------------------------------------
-          Write-Host ""
-          Write-Host "Checking CUDA installation..."
-
-          $nvcc = "$cudaPath\bin\nvcc.exe"
-          $cudart = "$cudaPath\lib\x64\cudart.lib"
-          $cublas = "$cudaPath\lib\x64\cublas.lib"
-          $cufft = "$cudaPath\lib\x64\cufft.lib"
-
-          if (-not (Test-Path $nvcc)) {
-            Write-Host ""
-            Write-Host "CUDA installation directory contents:"
-            
-            if (Test-Path $cudaPath) {
-              Get-ChildItem $cudaPath -Force |
-                Select-Object Name, FullName
-            }
-            else {
-              Write-Host "CUDA directory does not exist:"
-              Write-Host $cudaPath
-            }
-
-            throw "CUDA installation failed: nvcc.exe not found."
-          }
-
-          if (-not (Test-Path $cudart)) {
-            throw "CUDA installation failed: cudart.lib not found."
-          }
-
-          if (-not (Test-Path $cublas)) {
-            throw "CUDA installation failed: cublas.lib not found."
-          }
-
-          if (-not (Test-Path $cufft)) {
-            throw "CUDA installation failed: cufft.lib not found."
-          }
-
-          # ----------------------------------------------------------
-          # Export environment
-          # ----------------------------------------------------------
-          "CUDA_PATH=$cudaPath" |
-            Out-File $env:GITHUB_ENV -Append
-
-          "CUDA_TOOLKIT_ROOT_DIR=$cudaPath" |
-            Out-File $env:GITHUB_ENV -Append
-
-          "$cudaPath\bin" |
-            Out-File $env:GITHUB_PATH -Append
-
-          # ----------------------------------------------------------
-          # Final verification
-          # ----------------------------------------------------------
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "CUDA 12.4 INSTALLATION SUCCESS"
-          Write-Host "=============================================="
-
-          Write-Host ""
-          Write-Host "nvcc:"
-          & $nvcc --version
-
-          Write-Host ""
-          Write-Host "CUDA path:"
-          Write-Host $cudaPath
-
-          Write-Host ""
-          Write-Host "cudart.lib : OK"
-          Write-Host "cublas.lib : OK"
-          Write-Host "cufft.lib  : OK"
-
-          Write-Host ""
-          Write-Host "=============================================="
-
+      - name: Upload opencv_world500.dll / .lib
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencv_world500-cuda-win64
+          path: |
+            opencv/build/install/x64/vc17/bin/opencv_world500.dll
+            opencv/build/install/x64/vc17/lib/opencv_world500.lib
+          if-no-files-found: error
