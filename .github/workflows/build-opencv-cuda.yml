@@ -1,4 +1,5 @@
-name: Build opencv_world500 (CUDA, GTX 1660 / sm_75)
+```yaml
+name: Build opencv_world500 (CUDA 12.4, GTX 1660 / sm_75)
 
 on:
   workflow_dispatch:
@@ -19,13 +20,24 @@ jobs:
           git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv_contrib.git
 
       # ============================================================
-      # 2. NASM
+      # 2. Initialize MSVC environment
+      #
+      # This makes sure CMake/NVCC use the Visual Studio toolchain
+      # instead of accidentally inheriting another linker/compiler.
+      # ============================================================
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ============================================================
+      # 3. NASM
       # ============================================================
       - name: Setup NASM
         uses: ilammy/setup-nasm@v1
 
       # ============================================================
-      # 3. Cache CUDA installer
+      # 4. Cache CUDA installer
       # ============================================================
       - name: Cache CUDA installer
         uses: actions/cache@v4
@@ -34,13 +46,14 @@ jobs:
           key: cuda-12.4.0-network-installer
 
       # ============================================================
-      # 4. Install CUDA 12.4
+      # 5. Install CUDA 12.4
       # ============================================================
       - name: Install CUDA Toolkit
         shell: pwsh
         run: |
           if (-not (Test-Path "cuda_installer.exe")) {
             Write-Host "Downloading CUDA 12.4..."
+
             curl.exe -L `
               -o cuda_installer.exe `
               https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
@@ -52,6 +65,7 @@ jobs:
           $components = @(
             "nvcc_12.4",
             "cudart_12.4",
+            "cudart_dev_12.4",
             "cublas_12.4",
             "cublas_dev_12.4",
             "cufft_12.4",
@@ -72,7 +86,22 @@ jobs:
             throw "CUDA installation failed: nvcc.exe not found."
           }
 
+          if (-not (Test-Path "$cudaPath\lib\x64\cudart.lib")) {
+            throw "CUDA installation failed: cudart.lib not found."
+          }
+
+          if (-not (Test-Path "$cudaPath\lib\x64\cublas.lib")) {
+            throw "CUDA installation failed: cublas.lib not found."
+          }
+
+          if (-not (Test-Path "$cudaPath\lib\x64\cufft.lib")) {
+            throw "CUDA installation failed: cufft.lib not found."
+          }
+
           "CUDA_PATH=$cudaPath" |
+            Out-File $env:GITHUB_ENV -Append
+
+          "CUDA_TOOLKIT_ROOT_DIR=$cudaPath" |
             Out-File $env:GITHUB_ENV -Append
 
           "$cudaPath\bin" |
@@ -81,15 +110,50 @@ jobs:
           Write-Host "CUDA 12.4 installed successfully."
 
       # ============================================================
-      # 5. Patch Windows ulong problem
-      #
-      # OpenCV 5.0.0/contrib uses CUDA's 'ulong' spelling.
-      # MSVC/NVCC on Windows does not expose it automatically.
+      # 6. Verify compiler/linker environment
+      # ============================================================
+      - name: Verify MSVC + CUDA toolchain
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "TOOLCHAIN"
+          Write-Host "=============================================="
+
+          Write-Host ""
+          Write-Host "cl.exe:"
+          where.exe cl.exe
+
+          Write-Host ""
+          Write-Host "link.exe:"
+          where.exe link.exe
+
+          Write-Host ""
+          Write-Host "nvcc.exe:"
+          where.exe nvcc.exe
+
+          Write-Host ""
+          Write-Host "CUDA version:"
+          nvcc.exe --version
+
+          Write-Host ""
+          Write-Host "MSVC version:"
+          cl.exe 2>&1 | Select-Object -First 2
+
+          Write-Host ""
+          Write-Host "=============================================="
+
+      # ============================================================
+      # 7. Patch Windows ulong problem
       # ============================================================
       - name: Patch CUDA ulong
         shell: pwsh
         run: |
           $file = "opencv_contrib\modules\cudev\include\opencv2\cudev\common.hpp"
+
+          if (-not (Test-Path $file)) {
+            throw "common.hpp not found."
+          }
 
           $content = Get-Content $file -Raw
 
@@ -114,21 +178,7 @@ jobs:
           }
 
       # ============================================================
-      # 6. Complete OpenCV 5.0.0 64-bit CUDA cudev patch
-      #
-      # Provides:
-      #   MakeVec<int64_t, 1..4>
-      #   MakeVec<uint64_t, 1..4>
-      #
-      #   VecTraits<int64_t>
-      #   VecTraits<uint64_t>
-      #
-      #   VecTraits<longlong1..4>
-      #   VecTraits<ulonglong1..4>
-      #
-      # IMPORTANT:
-      # No 'longlong' or 'ulonglong' scalar aliases are created.
-      # Those were the source of the previous errors.
+      # 8. Complete OpenCV 5.0.0 CUDA 64-bit cudev patch
       # ============================================================
       - name: Patch CUDA 64-bit vector traits
         shell: pwsh
@@ -141,34 +191,19 @@ jobs:
 
           $content = Get-Content $file -Raw
 
-          # ----------------------------------------------------------
-          # Remove any previous experimental patch if present.
-          #
-          # This protects the build if this workflow is adapted from
-          # the previous version.
-          # ----------------------------------------------------------
-
+          # Remove previous version of our patch if present.
           $content = [regex]::Replace(
             $content,
-            '(?s)// OpenCV 5\.0 adds CV_64S / CV_64U\..*?#endif\s*',
+            '(?s)// OPENCV_CUDEV_64BIT_FIX.*?// END OPENCV_CUDEV_64BIT_FIX\s*',
             ''
           )
 
-          # ----------------------------------------------------------
-          # Make sure our patch isn't duplicated.
-          # ----------------------------------------------------------
           if ($content -match "OPENCV_CUDEV_64BIT_FIX") {
             Write-Host "64-bit patch already present."
             Set-Content -Path $file -Value $content -NoNewline
             exit 0
           }
 
-          # ----------------------------------------------------------
-          # Find the end of the existing ulong VecTraits block.
-          #
-          # We insert our definitions immediately after the existing
-          # OpenCV ulong traits.
-          # ----------------------------------------------------------
           $needle = "CV_CUDEV_VEC_TRAITS_INST(ulong)"
 
           if (-not $content.Contains($needle)) {
@@ -179,17 +214,7 @@ jobs:
 
           // ==========================================================
           // OPENCV_CUDEV_64BIT_FIX
-          //
-          // OpenCV 5.0.0 gpu_mat.cu instantiates cudev templates
-          // directly with int64_t / uint64_t.
-          //
-          // OpenCV 5.0.0's cudev vec_traits.hpp does not provide
-          // the required MakeVec/VecTraits implementations.
           // ==========================================================
-
-          // ----------------------------------------------------------
-          // MakeVec - signed 64-bit
-          // ----------------------------------------------------------
 
           template <> struct MakeVec<int64_t, 1>
           {
@@ -212,10 +237,6 @@ jobs:
           };
 
 
-          // ----------------------------------------------------------
-          // MakeVec - unsigned 64-bit
-          // ----------------------------------------------------------
-
           template <> struct MakeVec<uint64_t, 1>
           {
               typedef uint64_t type;
@@ -236,10 +257,6 @@ jobs:
               typedef ulonglong4 type;
           };
 
-
-          // ----------------------------------------------------------
-          // VecTraits - scalar int64_t
-          // ----------------------------------------------------------
 
           template <>
           struct VecTraits<int64_t>
@@ -271,10 +288,6 @@ jobs:
           };
 
 
-          // ----------------------------------------------------------
-          // VecTraits - scalar uint64_t
-          // ----------------------------------------------------------
-
           template <>
           struct VecTraits<uint64_t>
           {
@@ -304,10 +317,6 @@ jobs:
               }
           };
 
-
-          // ----------------------------------------------------------
-          // VecTraits - signed 64-bit CUDA vectors
-          // ----------------------------------------------------------
 
           template <>
           struct VecTraits<longlong1>
@@ -421,10 +430,6 @@ jobs:
               }
           };
 
-
-          // ----------------------------------------------------------
-          // VecTraits - unsigned 64-bit CUDA vectors
-          // ----------------------------------------------------------
 
           template <>
           struct VecTraits<ulonglong1>
@@ -563,7 +568,7 @@ jobs:
           Write-Host "64-bit CUDA cudev patch installed."
 
       # ============================================================
-      # 7. Verify that the source contains the complete fix
+      # 9. Verify source patches
       # ============================================================
       - name: Verify CUDA source patches
         shell: pwsh
@@ -607,25 +612,74 @@ jobs:
             }
           }
 
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "CUDA/OpenCV 5.0.0 patch verification PASSED"
-          Write-Host "=============================================="
-          Write-Host "ulong typedef             : OK"
-          Write-Host "MakeVec<int64_t>          : OK"
-          Write-Host "MakeVec<uint64_t>         : OK"
-          Write-Host "VecTraits<int64_t>        : OK"
-          Write-Host "VecTraits<uint64_t>       : OK"
-          Write-Host "signed 64-bit vectors     : OK"
-          Write-Host "unsigned 64-bit vectors   : OK"
-          Write-Host "=============================================="
+          Write-Host "CUDA/OpenCV source patches verified."
 
       # ============================================================
-      # 8. Configure OpenCV
+      # 10. Configure OpenCV
+      #
+      # IMPORTANT:
+      # CUDA_USE_STATIC_CUDA_RUNTIME=OFF
+      #
+      # This prevents OpenCV/CMake from trying to feed
+      # cudart_static into the final MSVC link in the problematic
+      # configuration seen in the previous build.
       # ============================================================
       - name: Configure with CMake
         shell: pwsh
         run: |
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+          $cudaBin = "$cudaPath\bin"
+          $cudaLib = "$cudaPath\lib\x64"
+
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (-not (Test-Path $vsWhere)) {
+            throw "vswhere.exe not found."
+          }
+
+          $vsInstall = & $vsWhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsInstall) {
+            throw "Visual Studio installation with C++ tools not found."
+          }
+
+          $msvcTools = Get-ChildItem `
+            "$vsInstall\VC\Tools\MSVC" `
+            -Directory |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+
+          if (-not $msvcTools) {
+            throw "MSVC tools directory not found."
+          }
+
+          $clPath = "$($msvcTools.FullName)\bin\Hostx64\x64\cl.exe"
+          $linkPath = "$($msvcTools.FullName)\bin\Hostx64\x64\link.exe"
+
+          if (-not (Test-Path $clPath)) {
+            throw "MSVC cl.exe not found: $clPath"
+          }
+
+          if (-not (Test-Path $linkPath)) {
+            throw "MSVC link.exe not found: $linkPath"
+          }
+
+          Write-Host ""
+          Write-Host "MSVC compiler:"
+          Write-Host $clPath
+
+          Write-Host ""
+          Write-Host "MSVC linker:"
+          Write-Host $linkPath
+
+          Write-Host ""
+          Write-Host "CUDA:"
+          Write-Host $cudaPath
+
           New-Item `
             -ItemType Directory `
             -Force `
@@ -636,17 +690,27 @@ jobs:
           cmake `
             -G "Visual Studio 17 2022" `
             -A x64 `
+            -T host=x64 `
             -D CMAKE_BUILD_TYPE=Release `
-            -D CMAKE_INSTALL_PREFIX="$PWD\install" `
-            -D BUILD_opencv_world=ON `
-            -D OPENCV_EXTRA_MODULES_PATH="$PWD\..\..\opencv_contrib\modules" `
-            -D WITH_CUDA=ON `
-            -D CUDA_ARCH_BIN=7.5 `
+            -D CMAKE_C_COMPILER="$clPath" `
+            -D CMAKE_CXX_COMPILER="$clPath" `
+            -D CMAKE_CUDA_COMPILER="$cudaBin\nvcc.exe" `
+            -D CMAKE_CUDA_HOST_COMPILER="$clPath" `
+            -D CUDA_TOOLKIT_ROOT_DIR="$cudaPath" `
+            -D CUDA_USE_STATIC_CUDA_RUNTIME=OFF `
+            -D CUDA_ARCH_BIN="7.5" `
             -D CUDA_ARCH_PTX= `
             -D CUDA_FAST_MATH=ON `
             -D ENABLE_FAST_MATH=ON `
+            -D WITH_CUDA=ON `
+            -D WITH_CUBLAS=ON `
+            -D WITH_CUFFT=ON `
+            -D WITH_NPP=ON `
             -D WITH_CUDNN=OFF `
             -D OPENCV_DNN_CUDA=OFF `
+            -D BUILD_opencv_world=ON `
+            -D OPENCV_EXTRA_MODULES_PATH="$PWD\..\..\opencv_contrib\modules" `
+            -D CMAKE_INSTALL_PREFIX="$PWD\install" `
             -D BUILD_TESTS=OFF `
             -D BUILD_PERF_TESTS=OFF `
             -D BUILD_EXAMPLES=OFF `
@@ -654,7 +718,49 @@ jobs:
             ..
 
       # ============================================================
-      # 9. Build
+      # 11. Inspect CMake CUDA configuration BEFORE compiling
+      #
+      # This catches the exact problem from the previous build.
+      # ============================================================
+      - name: Verify CMake CUDA configuration
+        shell: pwsh
+        run: |
+          Set-Location "opencv\build"
+
+          $cache = Get-Content "CMakeCache.txt" -Raw
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "CUDA CMAKE CONFIGURATION"
+          Write-Host "=============================================="
+
+          Select-String `
+            -Path "CMakeCache.txt" `
+            -Pattern "CUDA_TOOLKIT_ROOT_DIR|CUDA_USE_STATIC_CUDA_RUNTIME|CUDA_ARCH_BIN|CUDA_ARCH_PTX|CUDA_CUDART_LIBRARY|CUDA_cudart_static_LIBRARY|CUDA_CUBLAS|CUDA_cufft" |
+            ForEach-Object {
+              Write-Host $_.Line
+            }
+
+          Write-Host ""
+          Write-Host "=============================================="
+
+          if ($cache -match "CUDA_USE_STATIC_CUDA_RUNTIME:BOOL=ON") {
+            throw "CUDA_USE_STATIC_CUDA_RUNTIME is still ON."
+          }
+
+          if ($cache -match "CUDA_ARCH_BIN:STRING=7\.5") {
+            Write-Host "CUDA architecture 7.5: OK"
+          }
+          else {
+            throw "CUDA_ARCH_BIN is not configured for 7.5."
+          }
+
+          if ($cache -notmatch "CUDA_TOOLKIT_ROOT_DIR:PATH=.*CUDA\\v12\.4") {
+            Write-Host "WARNING: CUDA_TOOLKIT_ROOT_DIR cache entry was not exactly as expected."
+          }
+
+      # ============================================================
+      # 12. Build
       # ============================================================
       - name: Build + install
         shell: pwsh
@@ -665,10 +771,10 @@ jobs:
             --build . `
             --config Release `
             --target INSTALL `
-            -- /m
+            --parallel 2
 
       # ============================================================
-      # 10. Verify final binaries
+      # 13. Verify final binaries
       # ============================================================
       - name: Verify OpenCV binaries
         shell: pwsh
@@ -693,7 +799,7 @@ jobs:
           Write-Host "=============================================="
 
       # ============================================================
-      # 11. Upload
+      # 14. Upload
       # ============================================================
       - name: Upload OpenCV CUDA build
         uses: actions/upload-artifact@v4
@@ -703,3 +809,4 @@ jobs:
             opencv/build/install/x64/vc17/bin/opencv_world500.dll
             opencv/build/install/x64/vc17/lib/opencv_world500.lib
           if-no-files-found: error
+```
